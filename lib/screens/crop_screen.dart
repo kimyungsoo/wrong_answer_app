@@ -1,17 +1,15 @@
 import 'package:flutter/material.dart';
-import 'dart:io';
-import 'dart:async';
 import 'dart:typed_data';
-import 'dart:ui' as ui;
-import 'package:image/image.dart' as img;
 import '../models/crop_area.dart';
 
 class CropScreen extends StatefulWidget {
-  final String imagePath;
+  final Uint8List imageBytes;
+  final int startIndex;
 
   const CropScreen({
     super.key,
-    required this.imagePath,
+    required this.imageBytes,
+    this.startIndex = 0,
   });
 
   @override
@@ -19,42 +17,10 @@ class CropScreen extends StatefulWidget {
 }
 
 class _CropScreenState extends State<CropScreen> {
-  late ui.Image _uiImage;
-  late Size _imageSize;
-
   Offset? _dragStart;
   Offset? _dragEnd;
   final List<CropArea> _cropAreas = [];
-  bool _isImageLoaded = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadImage();
-  }
-
-  Future<void> _loadImage() async {
-    final bytes = await File(widget.imagePath).readAsBytes();
-    final image = img.decodeImage(bytes);
-
-    if (image != null) {
-      final ui.Image uiImage = await _convertImageToUiImage(image);
-      setState(() {
-        _uiImage = uiImage;
-        _imageSize = Size(image.width.toDouble(), image.height.toDouble());
-        _isImageLoaded = true;
-      });
-    }
-  }
-
-  Future<ui.Image> _convertImageToUiImage(img.Image image) async {
-    final bytes = image.toUint8List();
-    final completer = Completer<ui.Image>();
-    ui.decodeImageFromList(Uint8List.fromList(bytes), (result) {
-      completer.complete(result);
-    });
-    return completer.future;
-  }
+  Size? _containerSize;
 
   void _onDragStart(DragStartDetails details) {
     setState(() {
@@ -104,25 +70,24 @@ class _CropScreenState extends State<CropScreen> {
       return;
     }
 
-    // 워터마크된 이미지 생성 (나중에 PDF로 사용할 이미지들을 저장)
-    Navigator.of(context).pop(_cropAreas);
+    Navigator.of(context).pop((_cropAreas, _containerSize ?? const Size(400, 600)));
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_isImageLoaded) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('이미지 로딩 중...')),
-        body: const Center(child: CircularProgressIndicator()),
-      );
-    }
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('틀린 문제 선택'),
         backgroundColor: Theme.of(context).colorScheme.primary,
         foregroundColor: Colors.white,
         elevation: 0,
+        actions: [
+          TextButton.icon(
+            onPressed: () => Navigator.of(context).popUntil((r) => r.isFirst),
+            icon: const Icon(Icons.home, color: Colors.white, size: 18),
+            label: const Text('홈으로', style: TextStyle(color: Colors.white)),
+          ),
+        ],
       ),
       body: Column(
         children: [
@@ -134,7 +99,7 @@ class _CropScreenState extends State<CropScreen> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text(
-                  '선택된 문제: ${_cropAreas.length}개',
+                  '선택된 문제: ${_cropAreas.length}개 (오답 ${widget.startIndex + 1}번~)',
                   style: TextStyle(
                     fontSize: 14,
                     fontWeight: FontWeight.w600,
@@ -155,93 +120,131 @@ class _CropScreenState extends State<CropScreen> {
           ),
           // 이미지 캔버스
           Expanded(
-            child: GestureDetector(
-              onHorizontalDragStart: _onDragStart,
-              onHorizontalDragUpdate: _onDragUpdate,
-              onHorizontalDragEnd: _onDragEnd,
-              onVerticalDragStart: _onDragStart,
-              onVerticalDragUpdate: _onDragUpdate,
-              onVerticalDragEnd: _onDragEnd,
-              child: Container(
-                color: Colors.grey[100],
-                child: FitBox(
-                  child: CustomPaint(
-                    painter: _CropPainter(
-                      uiImage: _uiImage,
-                      cropAreas: _cropAreas,
-                      currentDrag: (_dragStart != null && _dragEnd != null)
-                          ? CropArea(start: _dragStart!, end: _dragEnd!)
-                          : null,
-                    ),
-                    size: _imageSize,
-                  ),
-                ),
-              ),
-            ),
-          ),
-          // 선택된 영역 목록
-          if (_cropAreas.isNotEmpty)
-            SizedBox(
-              height: 100,
-              child: ListView.builder(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.all(8),
-                itemCount: _cropAreas.length,
-                itemBuilder: (context, index) {
-                  return Padding(
-                    padding: const EdgeInsets.all(4),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                _containerSize = constraints.biggest;
+                return GestureDetector(
+                  onHorizontalDragStart: _onDragStart,
+                  onHorizontalDragUpdate: _onDragUpdate,
+                  onHorizontalDragEnd: _onDragEnd,
+                  onVerticalDragStart: _onDragStart,
+                  onVerticalDragUpdate: _onDragUpdate,
+                  onVerticalDragEnd: _onDragEnd,
+                  child: Container(
+                    color: Colors.grey[100],
                     child: Stack(
                       children: [
-                        Container(
-                          width: 80,
-                          height: 80,
-                          decoration: BoxDecoration(
-                            border: Border.all(
-                              color: Theme.of(context).colorScheme.primary,
-                              width: 2,
-                            ),
-                            borderRadius: BorderRadius.circular(8),
-                            color: Colors.white,
-                          ),
-                          child: Center(
-                            child: Text(
-                              '${index + 1}',
-                              style: const TextStyle(
-                                fontSize: 20,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
+                        Image.memory(
+                          widget.imageBytes,
+                          fit: BoxFit.contain,
+                          width: double.infinity,
+                          height: double.infinity,
                         ),
-                        Positioned(
-                          top: -8,
-                          right: -8,
-                          child: GestureDetector(
-                            onTap: () => _removeCropArea(index),
+                        CustomPaint(
+                          painter: _CropAreaPainter(
+                            cropAreas: _cropAreas,
+                            currentDrag: (_dragStart != null && _dragEnd != null)
+                                ? CropArea(start: _dragStart!, end: _dragEnd!)
+                                : null,
+                          ),
+                          size: Size.infinite,
+                        ),
+                        // 힌트 텍스트
+                        if (_cropAreas.isEmpty && _dragStart == null)
+                          Center(
                             child: Container(
-                              width: 24,
-                              height: 24,
+                              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
                               decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: Colors.red,
+                                color: Colors.black.withValues(alpha: 0.5),
+                                borderRadius: BorderRadius.circular(20),
                               ),
-                              child: const Icon(
-                                Icons.close,
-                                size: 14,
-                                color: Colors.white,
+                              child: const Text(
+                                '틀린 문제를 드래그하여 자르세요',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w500,
+                                ),
                               ),
                             ),
                           ),
-                        ),
+                        // 선택된 영역 목록 (오버레이)
+                        if (_cropAreas.isNotEmpty)
+                          Positioned(
+                            bottom: 0,
+                            left: 0,
+                            right: 0,
+                            child: Container(
+                              height: 100,
+                              color: Colors.black.withValues(alpha: 0.55),
+                              child: ListView.builder(
+                                scrollDirection: Axis.horizontal,
+                                padding: const EdgeInsets.all(8),
+                                itemCount: _cropAreas.length,
+                                itemBuilder: (context, index) {
+                                  return Padding(
+                                    padding: const EdgeInsets.all(4),
+                                    child: Stack(
+                                      clipBehavior: Clip.none,
+                                      children: [
+                                        Container(
+                                          width: 72,
+                                          height: 72,
+                                          decoration: BoxDecoration(
+                                            border: Border.all(color: Colors.white, width: 2),
+                                            borderRadius: BorderRadius.circular(8),
+                                            color: Colors.white.withValues(alpha: 0.2),
+                                          ),
+                                          child: Center(
+                                            child: Text(
+                                              '${widget.startIndex + index + 1}',
+                                              style: const TextStyle(
+                                                fontSize: 20,
+                                                fontWeight: FontWeight.bold,
+                                                color: Colors.white,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        Positioned(
+                                          top: -6,
+                                          right: -6,
+                                          child: GestureDetector(
+                                            onTap: () => _removeCropArea(index),
+                                            child: Container(
+                                              width: 22,
+                                              height: 22,
+                                              decoration: const BoxDecoration(
+                                                shape: BoxShape.circle,
+                                                color: Colors.red,
+                                              ),
+                                              child: const Icon(
+                                                Icons.close,
+                                                size: 13,
+                                                color: Colors.white,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
                       ],
                     ),
-                  );
-                },
-              ),
+                  ),
+                );
+              },
             ),
+          ),
           // 하단 버튼
-          Container(
-            padding: const EdgeInsets.all(16),
+          SafeArea(
+            top: false,
+            child: Container(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
             decoration: BoxDecoration(
               border: Border(top: BorderSide(color: Colors.grey[300]!)),
             ),
@@ -273,31 +276,25 @@ class _CropScreenState extends State<CropScreen> {
               ],
             ),
           ),
+          ),
         ],
       ),
     );
   }
 }
 
-class _CropPainter extends CustomPainter {
-  final ui.Image uiImage;
+class _CropAreaPainter extends CustomPainter {
   final List<CropArea> cropAreas;
   final CropArea? currentDrag;
 
-  _CropPainter({
-    required this.uiImage,
+  _CropAreaPainter({
     required this.cropAreas,
     this.currentDrag,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    // 이미지 그리기
-    canvas.drawImage(uiImage, Offset.zero, Paint());
-
-    // 확정된 크롭 영역 그리기
-    for (int i = 0; i < cropAreas.length; i++) {
-      final area = cropAreas[i];
+    for (final area in cropAreas) {
       canvas.drawRect(
         area.rect,
         Paint()
@@ -313,7 +310,6 @@ class _CropPainter extends CustomPainter {
       );
     }
 
-    // 현재 드래그 중인 영역 그리기
     if (currentDrag != null && currentDrag!.width > 0 && currentDrag!.height > 0) {
       canvas.drawRect(
         currentDrag!.rect,
@@ -332,23 +328,5 @@ class _CropPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_CropPainter oldDelegate) => true;
-}
-
-// 이미지를 화면 크기에 맞게 조정해서 표시하는 위젯
-class FitBox extends StatelessWidget {
-  final Widget child;
-
-  const FitBox({
-    super.key,
-    required this.child,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return FittedBox(
-      fit: BoxFit.contain,
-      child: child,
-    );
-  }
+  bool shouldRepaint(_CropAreaPainter oldDelegate) => true;
 }

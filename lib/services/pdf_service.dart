@@ -81,7 +81,7 @@ class PdfService {
     );
   }
 
-  /// A4 페이지에 이미지들을 자동 배치
+  /// A4 페이지에 이미지들을 자동 배치 (1열)
   static List<List<CroppedImage>> arrangeImagesOnPages(
     List<CroppedImage> images,
   ) {
@@ -90,13 +90,10 @@ class PdfService {
     double currentY = 0;
 
     for (final image in images) {
-      // 이미지 높이 계산 (너비에 맞춰서 높이 조정)
       final scaledHeight = (useableWidth / image.width) * image.height;
       final totalHeight = scaledHeight + spacing;
 
-      // 현재 페이지에 추가할 수 있는지 확인
       if (currentY + totalHeight > useableHeight && currentPage.isNotEmpty) {
-        // 새 페이지 시작
         pages.add(List.from(currentPage));
         currentPage.clear();
         currentY = 0;
@@ -106,8 +103,49 @@ class PdfService {
       currentY += totalHeight;
     }
 
-    // 마지막 페이지 추가
     if (currentPage.isNotEmpty) {
+      pages.add(currentPage);
+    }
+
+    return pages;
+  }
+
+  /// A4 페이지에 이미지들을 다열로 자동 배치
+  /// 반환: [ page[ column[ image ] ] ]
+  static List<List<List<CroppedImage>>> arrangeImagesOnPagesColumns(
+    List<CroppedImage> images,
+    int numColumns,
+  ) {
+    final columnGapPt = spacing * mmToPt;
+    final columnWidth =
+        (useableWidth - (numColumns - 1) * columnGapPt) / numColumns;
+    final usableHeightPt = useableHeight;
+
+    final pages = <List<List<CroppedImage>>>[];
+    var currentPage = List.generate(numColumns, (_) => <CroppedImage>[]);
+    var columnHeights = List.filled(numColumns, 0.0);
+    var currentCol = 0;
+
+    for (final image in images) {
+      final scaledHeight = (columnWidth / image.width) * image.height;
+      final totalHeight = scaledHeight + spacing * mmToPt;
+
+      if (columnHeights[currentCol] + totalHeight > usableHeightPt &&
+          currentPage[currentCol].isNotEmpty) {
+        currentCol++;
+        if (currentCol >= numColumns) {
+          pages.add(currentPage);
+          currentPage = List.generate(numColumns, (_) => <CroppedImage>[]);
+          columnHeights = List.filled(numColumns, 0.0);
+          currentCol = 0;
+        }
+      }
+
+      currentPage[currentCol].add(image);
+      columnHeights[currentCol] += totalHeight;
+    }
+
+    if (currentPage.any((col) => col.isNotEmpty)) {
       pages.add(currentPage);
     }
 

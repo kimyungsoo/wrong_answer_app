@@ -1,12 +1,12 @@
 import 'dart:typed_data';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
-import '../services/pdf_service.dart';
+import 'pdf_service.dart';
 
 class PdfGenerator {
-  /// 크롭된 이미지들로부터 PDF 생성
+  /// 1열 PDF 생성
   static Future<Uint8List> generatePdf(
-    List<List<PdfService.CroppedImage>> pages,
+    List<List<CroppedImage>> pages,
   ) async {
     final pdf = pw.Document();
 
@@ -14,10 +14,7 @@ class PdfGenerator {
       final widgets = <pw.Widget>[];
 
       for (final image in pageImages) {
-        // 이미지 데이터로부터 PDF 이미지 생성
         final pdfImage = pw.MemoryImage(image.imageData);
-
-        // 이미지 높이 계산 (A4 너비에 맞춰서)
         final scaledHeight =
             (PdfService.useableWidth / image.width) * image.height;
 
@@ -36,7 +33,6 @@ class PdfGenerator {
         );
       }
 
-      // 페이지 추가
       pdf.addPage(
         pw.Page(
           margin: pw.EdgeInsets.all(PdfService.marginLeft * PdfService.mmToPt),
@@ -44,6 +40,66 @@ class PdfGenerator {
           build: (context) => pw.Column(
             crossAxisAlignment: pw.CrossAxisAlignment.start,
             children: widgets,
+          ),
+        ),
+      );
+    }
+
+    return pdf.save();
+  }
+
+  /// 다열 PDF 생성
+  static Future<Uint8List> generatePdfColumns(
+    List<List<List<CroppedImage>>> pages,
+    int numColumns,
+  ) async {
+    final pdf = pw.Document();
+    final columnGapPt = PdfService.spacing * PdfService.mmToPt;
+    final columnWidth =
+        (PdfService.useableWidth - (numColumns - 1) * columnGapPt) / numColumns;
+    final spacingPt = PdfService.spacing * PdfService.mmToPt;
+
+    for (final pageColumns in pages) {
+      final rowChildren = <pw.Widget>[];
+
+      for (int colIdx = 0; colIdx < numColumns; colIdx++) {
+        final images = colIdx < pageColumns.length ? pageColumns[colIdx] : <CroppedImage>[];
+        final colWidgets = images.map((image) {
+          final pdfImage = pw.MemoryImage(image.imageData);
+          final scaledHeight = (columnWidth / image.width) * image.height;
+          return pw.Container(
+            margin: pw.EdgeInsets.only(bottom: spacingPt),
+            child: pw.Image(
+              pdfImage,
+              width: columnWidth,
+              height: scaledHeight,
+              fit: pw.BoxFit.fill,
+            ),
+          );
+        }).toList();
+
+        rowChildren.add(
+          pw.SizedBox(
+            width: columnWidth,
+            child: pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: colWidgets,
+            ),
+          ),
+        );
+
+        if (colIdx < numColumns - 1) {
+          rowChildren.add(pw.SizedBox(width: columnGapPt));
+        }
+      }
+
+      pdf.addPage(
+        pw.Page(
+          margin: pw.EdgeInsets.all(PdfService.marginLeft * PdfService.mmToPt),
+          pageFormat: PdfPageFormat.a4,
+          build: (context) => pw.Row(
+            crossAxisAlignment: pw.CrossAxisAlignment.start,
+            children: rowChildren,
           ),
         ),
       );
