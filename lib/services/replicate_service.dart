@@ -1,33 +1,39 @@
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
-import 'package:image/image.dart' as img;
-
-Uint8List _processRemoveHandwriting(Uint8List imageBytes) {
-  final decoded = img.decodeImage(imageBytes);
-  if (decoded == null) return imageBytes;
-
-  final maxVal = decoded.maxChannelValue;
-  final threshold = maxVal * 0.78; // 연필 자국(밝은 회색) 제거 임계값
-
-  for (final pixel in decoded) {
-    final luminance = 0.299 * pixel.r + 0.587 * pixel.g + 0.114 * pixel.b;
-    if (luminance > threshold) {
-      decoded.setPixelRgb(pixel.x, pixel.y, maxVal, maxVal, maxVal);
-    }
-  }
-
-  return Uint8List.fromList(img.encodeJpg(decoded, quality: 92));
-}
+import 'package:http/http.dart' as http;
 
 class ReplicateService {
+  static const String _serverUrl = 'http://192.168.0.192:8080';
+
   static bool get isConfigured => true;
 
   static Future<Uint8List> removeHandwriting(
     Uint8List imageBytes, {
     void Function(String status)? onStatus,
   }) async {
-    onStatus?.call('처리 중...');
-    return compute(_processRemoveHandwriting, imageBytes);
+    onStatus?.call('서버 연결 중...');
+
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('$_serverUrl/remove-handwriting'),
+    );
+    request.files.add(http.MultipartFile.fromBytes(
+      'file',
+      imageBytes,
+      filename: 'image.jpg',
+    ));
+
+    onStatus?.call('필기 제거 중...');
+    final streamedResponse = await request.send().timeout(
+      const Duration(seconds: 60),
+    );
+    final response = await http.Response.fromStream(streamedResponse);
+
+    if (response.statusCode == 200) {
+      onStatus?.call('완료');
+      return response.bodyBytes;
+    } else {
+      throw Exception('서버 오류: ${response.statusCode}');
+    }
   }
 
   static Future<List<Uint8List>> removeHandwritingBatch(
@@ -41,7 +47,6 @@ class ReplicateService {
         results.addAll(images.sublist(i));
         break;
       }
-      onProgress?.call(i + 1, images.length, '처리 중...');
       final result = await removeHandwriting(
         images[i],
         onStatus: (s) => onProgress?.call(i + 1, images.length, s),
