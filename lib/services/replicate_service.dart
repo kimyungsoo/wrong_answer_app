@@ -1,8 +1,9 @@
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 class ReplicateService {
-  static const String _serverUrl = 'http://192.168.0.192:8080';
+  static const String _serverUrl = 'https://api.wronganswerapp.com';
 
   static bool get isConfigured => true;
 
@@ -16,23 +17,40 @@ class ReplicateService {
       'POST',
       Uri.parse('$_serverUrl/remove-handwriting'),
     );
+
+    request.headers.addAll({
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+      'Accept': 'image/jpeg, */*',
+    });
+
     request.files.add(http.MultipartFile.fromBytes(
       'file',
       imageBytes,
       filename: 'image.jpg',
+      contentType: MediaType('image', 'jpeg'),
     ));
 
     onStatus?.call('필기 제거 중...');
-    final streamedResponse = await request.send().timeout(
-      const Duration(seconds: 60),
-    );
-    final response = await http.Response.fromStream(streamedResponse);
 
-    if (response.statusCode == 200) {
-      onStatus?.call('완료');
-      return response.bodyBytes;
-    } else {
-      throw Exception('서버 오류: ${response.statusCode}');
+    try {
+      final streamedResponse = await request.send().timeout(
+        const Duration(seconds: 120),
+      );
+      final response = await http.Response.fromStream(streamedResponse);
+
+      if (response.statusCode == 200) {
+        onStatus?.call('완료');
+        return response.bodyBytes;
+      } else {
+        final body = response.body.length > 200
+            ? response.body.substring(0, 200)
+            : response.body;
+        throw Exception('HTTP ${response.statusCode}: $body');
+      }
+    } on Exception {
+      rethrow;
+    } catch (e) {
+      throw Exception('연결 실패: $e');
     }
   }
 

@@ -1,76 +1,119 @@
-import io
+import asyncio
+import base64
+import json
+import re
 import numpy as np
 import cv2
 import torch
-from PIL import Image
+import ollama
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response
 from contextlib import asynccontextmanager
 
 model_manager = None
+sam_predictor = None
+_gpu_semaphore = None
+_waiting_count = 0
+
+SAM_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
-def create_handwriting_mask(image_bgr: np.ndarray) -> np.ndarray:
-    """
-    이미지에서 필기 영역을 자동 감지해 마스크 생성.
-    흰 배경 위의 연필/볼펜 필기를 탐지한다.
-    """
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+def detect_handwriting_boxes_llava(image_bgr: np.ndarray) -> list:
+    h, w = image_bgr.shape[:2]
+    _, encoded = cv2.imencode('.jpg', image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    img_base64 = base64.b64encode(encoded.tobytes()).decode('utf-8')
 
-    # 1) 색깔 있는 필기 (파란/빨간 볼펜 등)
-    colored_mask = np.zeros(gray.shape, dtype=np.uint8)
+    prompt = (
+        f"This is a Korean textbook page ({w}x{h} pixels). "
+        "Find all handwritten marks (student annotations, pen or pencil writing) "
+        "that are NOT part of the original printed content. "
+        "Return ONLY a JSON array of pixel bounding boxes: "
+        '[{"x1":int,"y1":int,"x2":int,"y2":int}]. '
+        "If no handwriting found, return []. No other text."
+    )
 
-    blue_lo, blue_hi = np.array([90, 40, 40]), np.array([130, 255, 255])
-    red_lo1, red_hi1 = np.array([0, 40, 40]), np.array([10, 255, 255])
-    red_lo2, red_hi2 = np.array([160, 40, 40]), np.array([180, 255, 255])
-    green_lo, green_hi = np.array([40, 40, 40]), np.array([85, 255, 255])
+    try:
+        response = ollama.chat(
+            model='llava',
+            messages=[{
+                'role': 'user',
+                'content': prompt,
+                'images': [img_base64]
+            }]
+        )
+        text = response['message']['content']
+        match = re.search(r'\[.*?\]', text, re.DOTALL)
+        if not match:
+            return []
 
-    for lo, hi in [(blue_lo, blue_hi), (red_lo1, red_hi1),
-                   (red_lo2, red_hi2), (green_lo, green_hi)]:
-        colored_mask = cv2.bitwise_or(colored_mask, cv2.inRange(hsv, lo, hi))
-
-    # 2) 연필 자국 (어두운 회색, 채도 낮음)
-    _, pencil_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-    saturation = hsv[:, :, 1]
-    low_sat = cv2.inRange(saturation, 0, 30)
-    pencil_mask = cv2.bitwise_and(pencil_mask, low_sat)
-
-    # 3) 인쇄된 텍스트(검정)는 제외 — 매우 어두운 픽셀 마스크 제거
-    printed_text = cv2.inRange(gray, 0, 60)
-    pencil_mask = cv2.bitwise_and(pencil_mask, cv2.bitwise_not(printed_text))
-
-    mask = cv2.bitwise_or(colored_mask, pencil_mask)
-
-    # 마스크를 살짝 팽창시켜 경계를 부드럽게
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.dilate(mask, kernel, iterations=2)
-
-    return mask
+        boxes = json.loads(match.group())
+        valid = []
+        for b in boxes:
+            x1 = max(0, min(int(b.get('x1', 0)), w - 1))
+            y1 = max(0, min(int(b.get('y1', 0)), h - 1))
+            x2 = max(0, min(int(b.get('x2', w)), w))
+            y2 = max(0, min(int(b.get('y2', h)), h))
+            if x2 - x1 > 5 and y2 - y1 > 5:
+                valid.append([x1, y1, x2, y2])
+        print(f"LLaVA 감지 영역: {len(valid)}개 → {valid}")
+        return valid
+    except Exception as e:
+        print(f"LLaVA 오류: {e}")
+        return []
 
 
-def inpaint_with_lama(image_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def create_mask_with_sam(image_bgr: np.ndarray, boxes: list) -> np.ndarray:
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    sam_predictor.set_image(image_rgb)
+
+    combined = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+    for box in boxes:
+        masks, _, _ = sam_predictor.predict(
+            box=np.array(box, dtype=float)[None, :],
+            multimask_output=False,
+        )
+        combined = cv2.bitwise_or(combined, (masks[0] * 255).astype(np.uint8))
+    return combined
+
+
+def _run_pipeline(image_bgr: np.ndarray) -> np.ndarray:
     from iopaint.schema import InpaintRequest, HDStrategy, LDMSampler
 
-    req = InpaintRequest(
-        hd_strategy=HDStrategy.ORIGINAL,
-        ldm_sampler=LDMSampler.ddim,
-    )
-    result = model_manager(image_bgr, mask, req)
-    return result
+    boxes = detect_handwriting_boxes_llava(image_bgr)
+    if not boxes:
+        print("필기 없음 → 원본 반환")
+        return image_bgr
+
+    mask = create_mask_with_sam(image_bgr, boxes)
+    if mask.sum() == 0:
+        return image_bgr
+
+    req = InpaintRequest(hd_strategy=HDStrategy.ORIGINAL, ldm_sampler=LDMSampler.ddim)
+    return model_manager(image_bgr, mask, req)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model_manager
-    print("LaMa 모델 로딩 중...")
-    from iopaint.model_manager import ModelManager
+    global model_manager, sam_predictor, _gpu_semaphore
+    _gpu_semaphore = asyncio.Semaphore(1)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"사용 디바이스: {device}")
+    print(f"디바이스: {device}")
+
+    print("LaMa 로딩 중...")
+    from iopaint.model_manager import ModelManager
     model_manager = ModelManager(name="lama", device=device)
-    print("모델 로딩 완료")
+
+    print("SAM 로딩 중...")
+    from segment_anything import sam_model_registry, SamPredictor
+    sam = sam_model_registry["vit_b"](checkpoint=SAM_CHECKPOINT)
+    sam.to(device)
+    sam_predictor = SamPredictor(sam)
+
+    print("모든 모델 로딩 완료")
     yield
     model_manager = None
+    sam_predictor = None
 
 
 app = FastAPI(title="필기 제거 서버", lifespan=lifespan)
@@ -82,28 +125,34 @@ async def health():
         "status": "ok",
         "cuda": torch.cuda.is_available(),
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "waiting": _waiting_count,
     }
 
 
 @app.post("/remove-handwriting")
 async def remove_handwriting(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
+    global _waiting_count
+
+    if (file.content_type
+            and not file.content_type.startswith("image/")
+            and file.content_type != "application/octet-stream"):
         raise HTTPException(status_code=400, detail="이미지 파일만 업로드 가능합니다")
 
     data = await file.read()
     np_arr = np.frombuffer(data, np.uint8)
     image_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
     if image_bgr is None:
         raise HTTPException(status_code=400, detail="이미지 디코딩 실패")
 
-    mask = create_handwriting_mask(image_bgr)
-
-    # 필기 감지 안 되면 원본 반환
-    if mask.sum() == 0:
-        return Response(content=data, media_type="image/jpeg")
-
-    result_bgr = inpaint_with_lama(image_bgr, mask)
+    _waiting_count += 1
+    try:
+        async with _gpu_semaphore:
+            _waiting_count -= 1
+            loop = asyncio.get_event_loop()
+            result_bgr = await loop.run_in_executor(None, _run_pipeline, image_bgr)
+    except Exception:
+        _waiting_count -= 1
+        raise
 
     _, encoded = cv2.imencode(".jpg", result_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return Response(content=encoded.tobytes(), media_type="image/jpeg")
