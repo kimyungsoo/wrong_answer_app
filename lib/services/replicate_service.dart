@@ -3,7 +3,7 @@ import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 
 class ReplicateService {
-  static const String _serverUrl = 'https://api.wronganswerapp.com';
+  static const String _serverUrl = 'https://wronganswerapp.com';
 
   static bool get isConfigured => true;
 
