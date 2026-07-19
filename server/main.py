@@ -1,91 +1,78 @@
 import asyncio
-import base64
-import json
-import re
 import numpy as np
 import cv2
 import torch
-import ollama
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response
 from contextlib import asynccontextmanager
 
 model_manager = None
-sam_predictor = None
 _gpu_semaphore = None
 _waiting_count = 0
+_ocr = None
 
-SAM_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
-
-def detect_handwriting_boxes_llava(image_bgr: np.ndarray) -> list:
+def detect_handwriting_mask(image_bgr: np.ndarray) -> np.ndarray:
     h, w = image_bgr.shape[:2]
-    _, encoded = cv2.imencode('.jpg', image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    img_base64 = base64.b64encode(encoded.tobytes()).decode('utf-8')
 
-    prompt = (
-        f"This is a Korean textbook page ({w}x{h} pixels). "
-        "Find all handwritten marks (student annotations, pen or pencil writing) "
-        "that are NOT part of the original printed content. "
-        "Return ONLY a JSON array of pixel bounding boxes: "
-        '[{"x1":int,"y1":int,"x2":int,"y2":int}]. '
-        "If no handwriting found, return []. No other text."
-    )
+    protected = np.zeros((h, w), dtype=np.uint8)
 
-    try:
-        response = ollama.chat(
-            model='llava',
-            messages=[{
-                'role': 'user',
-                'content': prompt,
-                'images': [img_base64]
-            }]
-        )
-        text = response['message']['content']
-        match = re.search(r'\[.*?\]', text, re.DOTALL)
-        if not match:
-            return []
+    # PaddleOCR로 인쇄 텍스트 영역 보호
+    result = _ocr.ocr(image_bgr)
+    text_count = 0
+    if result and result[0]:
+        for line in result[0]:
+            if not line:
+                continue
+            box = np.array(line[0], dtype=np.int32)
+            box[:, 0] = np.clip(box[:, 0], 0, w)
+            box[:, 1] = np.clip(box[:, 1], 0, h)
+            cv2.fillPoly(protected, [box], 255)
+            text_count += 1
 
-        boxes = json.loads(match.group())
-        valid = []
-        for b in boxes:
-            x1 = max(0, min(int(b.get('x1', 0)), w - 1))
-            y1 = max(0, min(int(b.get('y1', 0)), h - 1))
-            x2 = max(0, min(int(b.get('x2', w)), w))
-            y2 = max(0, min(int(b.get('y2', h)), h))
-            if x2 - x1 > 5 and y2 - y1 > 5:
-                valid.append([x1, y1, x2, y2])
-        print(f"LLaVA 감지 영역: {len(valid)}개 → {valid}")
-        return valid
-    except Exception as e:
-        print(f"LLaVA 오류: {e}")
-        return []
+    # 그림/도표 보호: 큰 사각형 윤곽선 검출
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 30, 100)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    figure_count = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > h * w * 0.005:  # 전체 이미지의 0.5% 이상인 큰 영역
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            cv2.rectangle(protected, (x, y), (x + cw, y + ch), 255, -1)
+            figure_count += 1
 
+    print(f"텍스트 보호: {text_count}개, 그림 보호: {figure_count}개")
 
-def create_mask_with_sam(image_bgr: np.ndarray, boxes: list) -> np.ndarray:
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    sam_predictor.set_image(image_rgb)
+    # 보호 영역 여백 확장
+    kernel = np.ones((10, 10), np.uint8)
+    protected = cv2.dilate(protected, kernel, iterations=1)
 
-    combined = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
-    for box in boxes:
-        masks, _, _ = sam_predictor.predict(
-            box=np.array(box, dtype=float)[None, :],
-            multimask_output=False,
-        )
-        combined = cv2.bitwise_or(combined, (masks[0] * 255).astype(np.uint8))
-    return combined
+    # 어두운 픽셀 감지
+    _, dark = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY_INV)
+
+    # 보호 영역 제외 = 필기 후보
+    handwriting = cv2.bitwise_and(dark, cv2.bitwise_not(protected))
+
+    # 노이즈 제거
+    kernel_open = np.ones((3, 3), np.uint8)
+    handwriting = cv2.morphologyEx(handwriting, cv2.MORPH_OPEN, kernel_open)
+
+    # 마스크 팽창
+    kernel_dilate = np.ones((5, 5), np.uint8)
+    handwriting = cv2.dilate(handwriting, kernel_dilate, iterations=2)
+
+    pixel_count = int(np.sum(handwriting > 0))
+    print(f"필기 후보 픽셀: {pixel_count}개")
+    return handwriting
 
 
 def _run_pipeline(image_bgr: np.ndarray) -> np.ndarray:
     from iopaint.schema import InpaintRequest, HDStrategy, LDMSampler
 
-    boxes = detect_handwriting_boxes_llava(image_bgr)
-    if not boxes:
-        print("필기 없음 → 원본 반환")
-        return image_bgr
-
-    mask = create_mask_with_sam(image_bgr, boxes)
+    mask = detect_handwriting_mask(image_bgr)
     if mask.sum() == 0:
+        print("필기 없음 → 원본 반환")
         return image_bgr
 
     req = InpaintRequest(hd_strategy=HDStrategy.ORIGINAL, ldm_sampler=LDMSampler.ddim)
@@ -94,26 +81,24 @@ def _run_pipeline(image_bgr: np.ndarray) -> np.ndarray:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model_manager, sam_predictor, _gpu_semaphore
+    global model_manager, _gpu_semaphore, _ocr
     _gpu_semaphore = asyncio.Semaphore(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"디바이스: {device}")
 
+    print("PaddleOCR 로딩 중...")
+    from paddleocr import PaddleOCR
+    _ocr = PaddleOCR(lang='korean')
+
     print("LaMa 로딩 중...")
     from iopaint.model_manager import ModelManager
     model_manager = ModelManager(name="lama", device=device)
 
-    print("SAM 로딩 중...")
-    from segment_anything import sam_model_registry, SamPredictor
-    sam = sam_model_registry["vit_b"](checkpoint=SAM_CHECKPOINT)
-    sam.to(device)
-    sam_predictor = SamPredictor(sam)
-
     print("모든 모델 로딩 완료")
     yield
     model_manager = None
-    sam_predictor = None
+    _ocr = None
 
 
 app = FastAPI(title="필기 제거 서버", lifespan=lifespan)
